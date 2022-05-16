@@ -1,12 +1,17 @@
 import argparse
-import os
+import os,re
 import random
 import shutil
 import time
 import warnings
 from enum import Enum
+from matplotlib import pyplot as plt
+import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 
+import torchvision
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
@@ -25,7 +30,7 @@ model_names = sorted(name for name in models.__dict__
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR', default='imagenet',
+parser.add_argument('-data', metavar='DIR', default='imagenet',
                     help='path to dataset (default: imagenet)')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     choices=model_names,
@@ -34,7 +39,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                         ' (default: resnet18)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
+parser.add_argument('--epochs', default=120, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -199,26 +204,53 @@ def main_worker(gpu, ngpus_per_node, args):
             scheduler.load_state_dict(checkpoint['scheduler'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
+            epoch = checkpoint['epoch']
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
+    traindir = os.path.join('/data/bitahub/Tiny-ImageNet', 'train')
+    valdir = os.path.join('/data/bitahub/Tiny-ImageNet', 'val')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
+                transforms.RandomResizedCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ]))
+    val_dataset = datasets.ImageFolder(
+        valdir,
+        transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
         ]))
 
+    f=open('/data/bitahub/Tiny-ImageNet/wnids.txt','r')
+    for line in f.readlines():
+        line=line.strip()
+        val_dataset.classes.append(line)
+    f.close()
+    val_dataset.classes.remove('images')
+    val_dataset.class_to_idx = train_dataset.class_to_idx
+    f=open('/data/bitahub/Tiny-ImageNet/val/val_annotations.txt','r')
+    imgs_list = []
+    target_list = []
+    for line in f.readlines():
+        re_line = re.match("(.*?)\s*?(n\d*?)\s",line)
+        imgs_list.append(("/data/bitahub/Tiny-ImageNet/val/images/"+str(re_line.group(1)),val_dataset.class_to_idx[re_line.group(2)]))
+        target_list.append(val_dataset.class_to_idx[re_line.group(2)])
+    val_dataset.imgs = imgs_list
+    val_dataset.samples = imgs_list
+    val_dataset.targets = target_list
+    
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     else:
@@ -229,17 +261,19 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
+        val_dataset,
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
+    #tensorboard
+    writer = SummaryWriter('/output/logs')
+    dataiter = iter(train_loader)
+    images, labels = dataiter.next()
+    writer.add_graph(model, images)
+    writer.flush()
+
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(val_loader, model, criterion, args,writer, epoch)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -247,10 +281,10 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, args,writer)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, criterion, args, writer, epoch)
         
         scheduler.step()
 
@@ -270,8 +304,50 @@ def main_worker(gpu, ngpus_per_node, args):
                 'scheduler' : scheduler.state_dict()
             }, is_best)
 
+def images_to_probs(net, images):
+    '''
+    Generates predictions and corresponding probabilities from a trained
+    network and a list of images
+    '''
+    output = net(images)
+    # convert output probabilities to predicted class
+    _, preds_tensor = torch.max(output, 1)
+    preds_cpu = preds_tensor.cpu()
+    preds = np.squeeze(preds_cpu.numpy())
+    return preds, [F.softmax(el, dim=0)[i].item() for i, el in zip(preds, output)]
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def matplotlib_imshow(img, one_channel=False):
+    if one_channel:
+        img = img.mean(dim=0)
+    img = img / 2 + 0.5     # unnormalize
+    npimg = img.numpy()
+    if one_channel:
+        plt.imshow(npimg, cmap="Greys")
+    else:
+        plt.imshow(np.transpose(npimg, (1, 2, 0)))
+        
+def plot_classes_preds(net, images, labels):
+    '''
+    Generates matplotlib Figure using a trained network, along with images
+    and labels from a batch, that shows the network's top prediction along
+    with its probability, alongside the actual label, coloring this
+    information based on whether the prediction was correct or not.
+    Uses the "images_to_probs" function.
+    '''
+    preds, probs = images_to_probs(net, images)
+    # plot the images in the batch, along with predicted and true labels
+    fig = plt.figure(figsize=(12, 12))
+    for idx in np.arange(4):
+        ax = fig.add_subplot(1, 4, idx+1, xticks=[], yticks=[])
+        matplotlib_imshow(images[idx], one_channel=True)
+        ax.set_title("{0}, {1:.1f}%\n(label: {2})".format(
+            preds[idx],
+            probs[idx] * 100.0,
+            labels[idx]),
+                    color=("green" if preds[idx]==labels[idx].item() else "red"))
+    return fig
+    
+def train(train_loader, model, criterion, optimizer, epoch, args,writer):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -286,6 +362,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
+    running_loss = 0.0
     for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -304,21 +381,39 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         losses.update(loss.item(), images.size(0))
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
+        
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
+        running_loss += loss.item()
+        if i % 100 == 99:    # every 100 mini-batches...
+
+            # ...log the running loss
+            writer.add_scalar('training loss',
+                            running_loss / 100,
+                            epoch * len(train_loader) + i)
+            '''
+            writer.add_figure('predictions vs. actuals',
+                            plot_classes_preds(model, images, target),
+                            global_step=epoch * len(train_loader) + i)
+            '''
+            running_loss = 0.0
+            #acc5 tensorboard
+            writer.add_scalar('train acc5',acc5,epoch * len(train_loader) + i)
+            writer.flush()
+
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
+
         if i % args.print_freq == 0:
             progress.display(i)
 
-
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, args, writer, epoch):
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
     losses = AverageMeter('Loss', ':.4e', Summary.NONE)
     top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
@@ -333,7 +428,10 @@ def validate(val_loader, model, criterion, args):
 
     with torch.no_grad():
         end = time.time()
+        val_loss = 0.0
+        n=0
         for i, (images, target) in enumerate(val_loader):
+            
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
             if torch.cuda.is_available():
@@ -349,19 +447,35 @@ def validate(val_loader, model, criterion, args):
             top1.update(acc1[0], images.size(0))
             top5.update(acc5[0], images.size(0))
 
+            val_loss = loss.item()
+                
+
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
 
             if i % args.print_freq == 0:
                 progress.display(i)
-
+            # ...log the running loss
+            writer.add_scalar('val loss',
+                            val_loss,
+                            n)
+            if 10<n<20:
+                writer.add_figure('predictions vs. actuals',
+                                    plot_classes_preds(model, images, target),
+                                    global_step=n)
+                writer.flush()
+            #acc5 tensorboard
+            writer.add_scalar('val acc5',acc5,n)
+            writer.flush()
+            n=n+1
         progress.display_summary()
+
 
     return top1.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, filename='/output/checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
